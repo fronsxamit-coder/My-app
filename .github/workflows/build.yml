@@ -39,16 +39,79 @@ jobs:
           flutter create . --org com.yourname --project-name nexchat --platforms android
           rm -rf lib pubspec.yaml && cp -r /tmp/keep/lib /tmp/keep/pubspec.yaml .
           cp google-services.json android/app/google-services.json
-          python3 tools/patch_android.py
+          cat > patch_android.py <<'PYEOF'
+          import re, json, pathlib, sys
+          a = pathlib.Path("android")
+          gs = json.load(open("google-services.json"))
+          pkg = gs["client"][0]["client_info"]["android_client_info"]["package_name"]
+          print("Firebase package:", pkg)
+
+          def find(*names):
+              for n in names:
+                  if (a / n).exists():
+                      return a / n
+              sys.exit("missing " + " / ".join(names))
+
+          # settings: declare google-services plugin
+          s = find("settings.gradle.kts", "settings.gradle")
+          t = s.read_text()
+          if "google-services" not in t:
+              kts = s.suffix == ".kts"
+              line = ('    id("com.google.gms.google-services") version "4.4.2" apply false\n' if kts
+                      else '    id "com.google.gms.google-services" version "4.4.2" apply false\n')
+              t = t.replace("\nplugins {\n", "\nplugins {\n" + line, 1)
+              s.write_text(t)
+
+          # app module
+          b = find("app/build.gradle.kts", "app/build.gradle")
+          t = b.read_text()
+          kts = b.suffix == ".kts"
+          if "google-services" not in t:
+              line = ('    id("com.google.gms.google-services")\n' if kts
+                      else '    id "com.google.gms.google-services"\n')
+              t = t.replace("plugins {\n", "plugins {\n" + line, 1)
+          t = re.sub(r'minSdk(Version)?\s*=?\s*(flutter\.minSdkVersion|\d+)',
+                     'minSdk = 23' if kts else 'minSdkVersion 23', t)
+          t = re.sub(r'applicationId\s*=?\s*"[^"]+"',
+                     f'applicationId = "{pkg}"' if kts else f'applicationId "{pkg}"', t)
+          b.write_text(t)
+
+          # more memory for gradle
+          gp = a / "gradle.properties"
+          g = gp.read_text() if gp.exists() else ""
+          g = re.sub(r'org\.gradle\.jvmargs=.*\n?', '', g)
+          gp.write_text(g.rstrip() + "\norg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g\n")
+
+          # manifest permissions + label
+          m = a / "app/src/main/AndroidManifest.xml"
+          t = m.read_text()
+          perms = ["INTERNET", "CAMERA", "RECORD_AUDIO", "MODIFY_AUDIO_SETTINGS",
+                   "READ_MEDIA_IMAGES", "READ_MEDIA_VIDEO"]
+          add = "".join(f'    <uses-permission android:name="android.permission.{p}"/>\n'
+                        for p in perms if p not in t)
+          t = re.sub(r'(<manifest[^>]*>\n)', lambda mo: mo.group(1) + add, t, count=1)
+          t = t.replace('android:label="nexchat"', 'android:label="NexChat"')
+          m.write_text(t)
+          print("patched OK")
+          PYEOF
+          python3 patch_android.py
           mkdir -p ~/.android && cp keystore/debug.keystore ~/.android/debug.keystore
 
       - name: Build
         working-directory: nexchat
         run: |
           flutter pub get
-          flutter build apk --release --split-per-abi
+          set +e
+          flutter build apk --release --split-per-abi -v > build.log 2>&1
+          CODE=$?
+          if [ $CODE -ne 0 ]; then
+            echo "=========== REAL ERROR ==========="
+            grep -n -B2 -A12 -E "What went wrong|FAILURE|error:|Error:|e: " build.log | tail -60
+          fi
+          exit $CODE
 
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: nexchat-apk
           path: nexchat/build/app/outputs/flutter-apk/*.apk
